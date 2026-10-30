@@ -1,0 +1,23 @@
+{
+  "name": "dsh-journal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "把散在微信、对话和本子里的想法，压实成一份能读的账本。DeepSeek Harness 插件。",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "install-plugin": "node install.mjs",
+    "check": "node scripts/check.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CRYPTOCHROME384/DSH-Wechat-Journal.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CRYPTOCHROME384/DSH-Wechat-Journal/issues"
+  }
+}

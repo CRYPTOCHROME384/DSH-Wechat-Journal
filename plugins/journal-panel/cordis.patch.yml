@@ -1,0 +1,9 @@
+# 由 `node install.mjs` 自动填写。
+# 手动安装时把下面两个路径改成你自己的绝对路径（Windows 用正斜杠或双反斜杠）。
+- insert:
+    - id: journal-panel
+      name: '@local/journal-panel'
+      config:
+        dataDir: ''
+        readingInbox: ''
+        # python: 'python'   # 可选：指定解释器

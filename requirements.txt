@@ -1,0 +1,2 @@
+# reading-inbox 的两个抓取脚本用到
+requests>=2.28

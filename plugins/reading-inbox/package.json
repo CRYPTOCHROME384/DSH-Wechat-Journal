@@ -1,0 +1,39 @@
+{
+  "name": "@local/reading-inbox",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "微信碎片阅读收件箱：收集转发链接，每周整理成周报。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "wechat.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "tools/*.py",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CRYPTOCHROME384/DSH-Wechat-Journal.git"
+  }
+}

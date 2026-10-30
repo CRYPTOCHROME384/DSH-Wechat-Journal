@@ -1,0 +1,33 @@
+{
+  "name": "@local/journal-panel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "任务/想法账本的可视化面板：项目分类可增删，条目可勾选。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CRYPTOCHROME384/DSH-Wechat-Journal.git"
+  }
+}

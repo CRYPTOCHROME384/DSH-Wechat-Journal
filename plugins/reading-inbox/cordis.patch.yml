@@ -1,0 +1,8 @@
+# 由 `node install.mjs` 自动填写。
+# 手动安装时把 dataDir 改成你自己的绝对路径（Windows 用正斜杠或双反斜杠）。
+- insert:
+    - id: reading-inbox
+      name: '@local/reading-inbox'
+      config:
+        dataDir: ''
+        # journalDir: ''   # 省略则用 reading-inbox 同级的 journal/

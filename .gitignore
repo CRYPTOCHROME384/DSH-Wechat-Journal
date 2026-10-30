@@ -1,0 +1,41 @@
+# 数据目录（默认 ~/.dsh-journal/），整目录不进版本库
+data/
+*.local/
+
+# 依赖与构建
+node_modules/
+__pycache__/
+*.pyc
+.pnpm-store/
+
+# 安装器备份
+*.dsh-journal.bak
+
+# 凭据——**绝对不要提交**
+wechat.json
+*.token
+.env
+.env.*
+!.env.example
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+# Runtime data and credential write buffers
+reading-inbox-data/
+wechat.json.*
+wechat-events.json*
+inbox.json*
+schedules-ready.md
+*.log
+/journal/*.json
+/journal/*.jsonl
+/journal/*.tmp
+/journal/*.lock
+/journal/capture/
+/journal/projects/
+/journal/reports/
+/journal/board.md
+/journal/notebook.md

@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "Reading Inbox",
+    "description": "Collect links forwarded in WeChat, extract them, and curate a weekly digest."
+  },
+  "panel": {
+    "title": "Reading Inbox",
+    "subtitle": "Links forwarded from WeChat land here, curated once a week."
+  }
+}
