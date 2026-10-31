@@ -421,7 +421,7 @@ window.__ModuleLoader__.load({
         try { if (await onAdd({ text: text.trim(), project })) { setDraft(current => current === text ? '' : current); setFilter('open') } }
         finally { setBusy(false) }
       }
-      const groups = [{ id: '', name: '未分类' }, ...state.projects]
+      const groups = [{ id: '', name: '未关联项目' }, ...state.projects]
       return h('div', null,
         h('div', { className: 'jp-toolbar' },
           h('div', { className: 'jp-segments', 'aria-label': '任务状态' },
@@ -488,9 +488,10 @@ window.__ModuleLoader__.load({
       const bound = (state.file_sources || []).filter(s=>s.id===project.id)
       const [open,setOpen]=useState(false)
       const [folder,setFolder]=useState(null)
+      const [directoryPath,setDirectoryPath]=useState('')
       const [busy,setBusy]=useState(false)
       const [error,setError]=useState('')
-      const browse=async(root='')=>{setBusy(true);setError('');try{setFolder(await api('sources/browse?root='+encodeURIComponent(root)));setOpen(true)}catch(e){setError(e.message)}finally{setBusy(false)}}
+      const browse=async(root='')=>{setOpen(true);setBusy(true);setError('');try{const next=await api('sources/browse?root='+encodeURIComponent(root));setFolder(next);setDirectoryPath(next.root)}catch(e){setFolder(null);setError(e.message)}finally{setBusy(false)}}
       const change=async(action,root)=>{setBusy(true);setError('');try{if(!await onAction(action,{id:project.id,root}))setError('未保存，请重试。')}catch(e){setError(e.message)}finally{setBusy(false)}}
       return h('section',{className:'jp-project-section'},h('h3',{className:'jp-section-title'},`项目来源 · ${bound.length}`),
         bound.map(row=>h('div',{key:row.key||row.root,style:{display:'flex',gap:12,alignItems:'center',marginBottom:12}},
@@ -498,12 +499,17 @@ window.__ModuleLoader__.load({
           h('button',{className:'jp-act',disabled:busy,onClick:()=>change('sources.unbind',row.root)},'解除关联'))),
         h('button',{className:'jp-btn ghost',disabled:busy,onClick:()=>open?setOpen(false):browse()},open?'关闭浏览':'浏览添加目录'),
         error?h('p',{className:'jp-error',role:'alert'},error):null,
-        open&&folder?h('div',{style:{padding:16,border:'1px solid var(--dsw-alias-border-l1)',borderRadius:12,marginTop:12}},
-          h('p',{style:{overflowWrap:'anywhere',fontSize:15}},folder.root),
-          h('div',{className:'jp-row'},folder.parent?h('button',{className:'jp-act',disabled:busy,onClick:()=>browse(folder.parent)},'上一级'):null,
-            h('button',{className:'jp-btn',disabled:busy||bound.some(s=>s.root.toLowerCase()===folder.root.toLowerCase()),onClick:()=>change('sources.bind',folder.root)},bound.some(s=>s.root.toLowerCase()===folder.root.toLowerCase())?'已添加':'添加当前目录')),
-          folder.children.map(child=>h('button',{key:child.root,className:'jp-project-task',disabled:busy,onClick:()=>browse(child.root)},'▸ '+child.name)),
-          !folder.children.length?h('p',null,'没有子目录'):null):null,
+        open?h('div',{style:{padding:16,border:'1px solid var(--dsw-alias-border-l1)',borderRadius:12,marginTop:12}},
+          h('form',{className:'jp-addrow',onSubmit:e=>{e.preventDefault();if(!busy&&directoryPath.trim())browse(directoryPath.trim())}},
+            h('input',{className:'jp-input','aria-label':'目录路径',placeholder:'输入完整目录路径，或 ~/目录名',value:directoryPath,disabled:busy,onChange:e=>setDirectoryPath(e.target.value)}),
+            h('button',{className:'jp-btn ghost',type:'submit',disabled:busy||!directoryPath.trim()},'前往')),
+          h('div',{className:'jp-row'},(folder?.shortcuts||[]).map(shortcut=>h('button',{key:shortcut.root,className:'jp-act',disabled:busy,onClick:()=>browse(shortcut.root)},shortcut.name))),
+          folder?h('div',null,
+            h('p',{style:{overflowWrap:'anywhere',fontSize:15}},folder.root),
+            h('div',{className:'jp-row'},folder.parent?h('button',{className:'jp-act',disabled:busy,onClick:()=>browse(folder.parent)},'上一级'):null,
+              h('button',{className:'jp-btn',disabled:busy||bound.some(s=>s.root===folder.root),onClick:()=>change('sources.bind',folder.root)},bound.some(s=>s.root===folder.root)?'已添加':'添加当前目录')),
+            folder.children.map(child=>h('button',{key:child.root,className:'jp-project-task',disabled:busy,onClick:()=>browse(child.root)},'▸ '+child.name)),
+            !folder.children.length?h('p',null,'没有子目录；可以直接添加当前目录，或前往其他路径。'):null):null):null,
         h('p',{className:'jp-hint'},'可添加多个目录。解除关联只停止归属，不删除文件或已确认进展。文献、本子和微信在活动中选择项目。'))
     }
 
@@ -530,7 +536,7 @@ window.__ModuleLoader__.load({
       const decide=async decision=>{
         if(lock.current)return
         if(decision==='confirmed' && (!selected.length || !summary.trim() || !quote.trim())) {
-          setError(!selected.length?'选一个项目，就可以把它留进进展。':'补上一句进展和原文依据即可。');return
+          setError(!selected.length?'请选择要更新的项目。':'请填写进展摘要和原文引用。');return
         }
         lock.current=true;setBusy(true);setError('')
         try {if(!await onDecision({id:record.id,decision,projects:selected,summary,quote}))setError('这一步没有保存，请查看错误后重试。')}
@@ -599,10 +605,10 @@ window.__ModuleLoader__.load({
       }
       return h('section',{ref:reviewRef,className:'jp-review','aria-label':'整理新发现'},
         h('div',{className:'jp-review-head'},h('div',null,h('h2',null,'整理新发现'),
-          h('div',{className:'jp-review-count','aria-live':'polite'},pending.length?`还有 ${pending.length} 组${completed?` · 本次已整理 ${completed} 条`:''}`:'都整理好了')),
+          h('div',{className:'jp-review-count','aria-live':'polite'},pending.length?`还有 ${pending.length} 组${completed?` · 本次已处理 ${completed} 条来源`:''}`:'没有待核对来源')),
           last?h('button',{className:'jp-act',onClick:undo,disabled:undoBusy},'撤销上一步'):null),
         current?h('div',null,h(ReviewCard,{key:current.id,record:current,projects:state.projects,onDecision:decide,onLater:later}),current.members?h('details',{className:'jp-project-section'},h('summary',{className:'jp-summary'},`查看这批 ${current.member_count} 个文件`),h('p',null,current.excerpt),h('div',{style:{maxHeight:400,overflow:'auto',fontSize:15,lineHeight:1.8}},(state.evidence?.records||[]).filter(r=>current.members.includes(r.id)).map(r=>h('details',{key:r.id},h('summary',{style:{overflowWrap:'anywhere'}},r.title),h('pre',{style:{whiteSpace:'pre-wrap',overflowWrap:'anywhere'}},r.locator+'\n\n'+r.excerpt))))):null):
-          h('div',{className:'jp-review-empty'},pending.length?'先到这里，剩下的可以慢慢看。':'新发现已经各归其处。',
+          h('div',{className:'jp-review-empty'},pending.length?'剩余来源已设为稍后处理，可继续核对。':'没有待核对来源。已确认进展可在项目页查看。',
             pending.length?h('div',null,h('button',{className:'jp-act',onClick:()=>setDeferred([])},`继续看 ${pending.length} 组`)):null),
         h('details',{className:'jp-review-status'},h('summary',null,'来源状态与操作说明'),
           h('p',null,'略过只是不纳入进展，原始记录仍会保留；稍后只调整本次阅读顺序。聚焦卡片后可用方向键：← 略过，↓ 稍后，→ 加入。'),
@@ -660,7 +666,7 @@ window.__ModuleLoader__.load({
         items.map(item => h('div', { key: item.id, className: 'jp-idea' },
           h('div', { className: 'jp-idea-main' },
             h('div', { className: 'jp-idea-text' }, item.text),
-            h('div', { className: 'jp-hint' }, `${state.projects.find(p => p.id === item.project)?.name || '悬着'} · ${completedAt(item).slice(0,10)} 完成`)),
+            h('div', { className: 'jp-hint' }, `${state.projects.find(p => p.id === item.project)?.name || '未关联项目'} · ${completedAt(item).slice(0,10)} 完成`)),
           h('button', { className: 'jp-act', onClick: () => onEdit(item.id) }, '详情'),
           h('button', { className: 'jp-act', onClick: () => onSet(item.id, { status: 'open' }) }, '重新打开'))))
     }
@@ -685,7 +691,7 @@ window.__ModuleLoader__.load({
               { className: 'jp-idea-main' },
               h('div', { className: 'jp-idea-text' }, idea.text),
               h('div', { className: 'jp-idea-meta' },
-                `${idea.created.slice(0, 10)} · ${state.projects.find(p => p.id === idea.project)?.name || '未归属'}${idea.status === 'parked' ? ' · 暂缓' : ''}`),
+                `${idea.created.slice(0, 10)} · ${state.projects.find(p => p.id === idea.project)?.name || '未关联项目'}${idea.status === 'parked' ? ' · 暂缓' : ''}`),
             ),
             h(
               'div',
@@ -740,7 +746,7 @@ window.__ModuleLoader__.load({
     }
 
     const FIELD_LABEL = { goal: '目标', state: '进展', next: '下一步', open: '未决问题', name: '名称', type: '类型', place: '地点', status: '状态', project: '归属', text: '内容', due: '截止日期', due_raw: '截止原文', at: '发生时间', at_raw: '发生原文', ev: '来源', evidence: '来源确认' }
-    const STATUS_LABEL = { open: '未完成', done: '已完成', parked: '暂缓', dropped: '已丢弃', new: '待判断', promoted: '已转为任务' }
+    const STATUS_LABEL = { open: '待办', done: '已完成', parked: '已暂缓', dropped: '已放弃', new: '已保存', promoted: '已转为任务' }
 
     function RecentTab({ state }) {
       const { data: rows, error, retry } = useRemoteData('recent?limit=60', (state.evidence?.records || []).map(r => r.review_revision || '').join('|'))
@@ -748,7 +754,7 @@ window.__ModuleLoader__.load({
       if (!rows) return h('div', { className: 'jp-loading', role: 'status' }, '读取中…')
       if (!Array.isArray(rows)) return h(LoadError, { error: '改动记录格式异常', retry })
       const valueLabel = (field, value) => field === 'status' ? STATUS_LABEL[value] || brief(value)
-        : field === 'project' ? state.projects.find(p => p.id === value)?.name || (value ? '已移除项目' : '悬着') : brief(value)
+        : field === 'project' ? state.projects.find(p => p.id === value)?.name || (value ? '已移除项目' : '未关联项目') : brief(value)
       return h('div', null,
         error ? h(LoadError, { error, retry }) : null,
         !rows.length ? h('div', { className: 'jp-empty' }, '还没有改动记录。') : null,
@@ -1021,9 +1027,9 @@ window.__ModuleLoader__.load({
         setSaving(true)
         try {
           const patch = detailPatch(item, form)
-          await onSave(patch)
+          const result = await onSave(patch)
           dialog.current?.close()
-          onSaved(form.type, form.type !== item.type)
+          onSaved(form.type, form.type !== item.type, result)
         } catch (e) { setError(e.message || '保存失败，草稿已保留') }
         finally { setSaving(false) }
       }
@@ -1057,7 +1063,7 @@ window.__ModuleLoader__.load({
                 h('option', { value: 'task' }, '任务'), h('option', { value: 'idea' }, '想法'))),
               label('项目归属', h('select', { className: 'jp-input', value: form.project, disabled: saving,
                 'aria-label': '项目归属', onChange: e => change('project', e.target.value) },
-                h('option', { value: '' }, '未归属'),
+                h('option', { value: '' }, '未关联项目'),
                 projects.map(project => h('option', { key: project.id, value: project.id }, project.name)))),
             ),
             h('p', { className: 'jp-hint' },
@@ -1109,6 +1115,27 @@ window.__ModuleLoader__.load({
     }
 
 
+    function actionNotice(action, payload, result) {
+      if (action === 'item.add') return `${(result.type || payload.type) === 'idea' ? '已保存想法' : '已加入待办'}：${result.text || payload.text}。`
+      if (action === 'item.set') {
+        if (Array.isArray(result.changed) && !result.changed.length) return '内容未变化，无需更新。'
+        if (result.changed?.includes('status')) return `已更新状态：${STATUS_LABEL[payload.status] || payload.status}。`
+        return '条目修改已保存。'
+      }
+      if (action === 'idea.promote') return result.duplicate ? '关联待办已存在，未重复创建。' : '已将想法转为待办。'
+      if (action === 'project.add') return `已创建项目：${result.name || payload.name}。`
+      if (action === 'project.set') return '项目修改已保存。'
+      if (action === 'project.remove') return `已移除项目，保留原有条目${result.items_detached ? `；${result.items_detached} 条记录已解除项目关联` : ''}。`
+      if (action === 'evidence.decide') return result.unchanged ? '该来源已处理，未重复更新。'
+        : payload.decision === 'ignored' ? '已略过该来源，未加入项目进展；原始记录已保留。' : '已加入项目进展时间线。'
+      if (action === 'evidence.undo') return '已撤销来源处理，恢复为待核对；原始记录已保留。'
+      if (action === 'sources.scan') return '已执行来源扫描，请查看各来源的检查结果。'
+      if (action === 'sources.bind') return '已关联来源目录。'
+      if (action === 'sources.unbind') return '已解除目录关联，未删除文件。'
+      if (action === 'notebook.day.save' || action === 'notebook.save') return '本子已保存。'
+      return '操作已完成。'
+    }
+
     function Page() {
       const [state, setState] = useState(null)
       const [tab, setTab] = useState('now')
@@ -1140,7 +1167,9 @@ window.__ModuleLoader__.load({
         async (action, payload) => {
           try {
             setError('')
+            setNotice('')
             const result = await api('action', { action, ...payload })
+            setNotice(actionNotice(action, payload, result))
             await load()
             return result
           } catch (e) {
@@ -1187,13 +1216,14 @@ window.__ModuleLoader__.load({
             key: editingId, id: editingId, projects: state.projects,
             onClose: () => setEditingId(null),
             onSave: async patch => {
-              await api('action', { action: 'item.set', ...patch })
+              const result = await api('action', { action: 'item.set', ...patch })
               await load()
+              return result
             },
-            onSaved: (type, corrected) => {
+            onSaved: (type, corrected, result) => {
               setEditingId(null)
               if (corrected) setTab(type === 'task' ? 'now' : 'ideas')
-              setNotice(corrected ? `已纠正为${type === 'task' ? '任务' : '想法'}，原条目 ID、来源和历史已保留。` : '已保存条目修改。')
+              setNotice(Array.isArray(result.changed) && !result.changed.length ? '内容未变化，无需更新。' : corrected ? `已改为${type === 'task' ? '待办' : '想法'}，来源和修改历史已保留。` : '条目修改已保存。')
             },
           }) : null,
           notice ? h('div', { className: 'jp-notice', role: 'status' }, notice,

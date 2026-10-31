@@ -11,9 +11,11 @@ import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 
-import { WeChatBot } from './wechat.js'
+import { WeChatBot, extractUrls } from './wechat.js'
+import { JournalLlm, triageMessage, chatErrorMessage, modelErrorCode } from './llm.js'
+import { JournalChat, chatCommand } from './chat.js'
 
 const HERE = fileURLToPath(new URL('.', import.meta.url))
 
@@ -21,6 +23,15 @@ const HERE = fileURLToPath(new URL('.', import.meta.url))
 export const inject = ['tools', 'webServer']
 
 const STATUSES = ['inbox', 'later', 'read', 'dropped']
+const STATUS_LABELS = { inbox: '待读', later: '稍后阅读', read: '已读', dropped: '已移出阅读列表' }
+const WECHAT_STATUS_LABELS = { idle: '未连接', waiting: '等待扫码确认', connected: '已连接', error: '连接失败' }
+function readingReceipt(result, title = '') {
+  const label = title || result.item.title
+  const subject = label ? `《${label}》` : '这条链接'
+  const outcome = result.restored ? '已恢复到阅读收件箱' : result.updated ? '已补充资料备注'
+    : result.duplicate ? '这条资料已存在，未重复添加' : '已加入阅读收件箱'
+  return `${outcome}：${subject}（${STATUS_LABELS[result.item.status] || result.item.status}）。`
+}
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
 /* ------------------------------------------------------------------ utils */
@@ -473,17 +484,58 @@ export function apply(ctx, config = {}) {
 
   const log = (message) => process.stderr.write(`[reading-inbox] ${message}\n`)
   const ui = { pageLoads: 0, lastPageLoadAt: 0 }
+  const llm = new JournalLlm(config.llm || {})
+  const chatEnabled = config.chat?.enabled !== false && llm.enabled
+  const journalDir =
+    typeof config.journalDir === 'string' && config.journalDir.trim()
+      ? config.journalDir.trim()
+      : process.env.JOURNAL_DIR || join(HERE, '..', 'journal')
+  llm.journalDir = journalDir
+  const chat = new JournalChat({ dir: journalDir, llm, rules: async () => {
+    try { return await readFile(join(journalDir, 'RULES.md'), 'utf8') }
+    catch { throw Object.assign(new Error('未能读取账本规则'), { code: 'JOURNAL_CONTEXT_FAILED' }) }
+  }, context: async () => {
+    try { return await journalCommand(['chat-context']) }
+    catch { throw Object.assign(new Error('未能读取账本上下文'), { code: 'JOURNAL_CONTEXT_FAILED' }) }
+  } })
+  let triageQueue = Promise.resolve()
+  ctx.inject(['llm'], (modelCtx) => {
+    llm.runtime = modelCtx.llm
+    llm.status.available = true
+    modelCtx.on('llm/stream', (options, next) => {
+      llm.observe(options)
+      return next()
+    })
+    modelCtx.effect(() => () => llm.stop())
+  })
+  ctx.inject(['agents'], (agentCtx) => {
+    llm.agents = agentCtx.agents
+    agentCtx.effect(() => () => { llm.agents = null })
+  })
+  ctx.inject(['agentDefaultModel'], (modelCtx) => {
+    llm.defaultModel = modelCtx.agentDefaultModel
+    modelCtx.effect(() => () => { llm.defaultModel = null })
+  })
+  ctx.inject(['schedule', 'sessionController'], (scheduleCtx) => {
+    llm.schedule = scheduleCtx.schedule
+    llm.sessionController = scheduleCtx.sessionController
+    scheduleCtx.effect(() => () => { llm.schedule = null; llm.sessionController = null })
+  })
 
   const bot = new WeChatBot({
     dir: dataDir,
     log,
     onMessage: (event) => {
-      void triage(event)
-      if (!event.urls.length) return
-      const note = event.text.replace(/https?:\/\/\S+/gu, '').trim().slice(0, 1000)
-      for (const url of event.urls) {
-        addItem({ url, note, source: 'wechat' }).catch((error) => log(`收录失败：${error.message}`))
+      // A private ledger must only be exposed to the account paired at login.
+      if (!event.from || event.from !== bot.credential?.ilink_user_id) {
+        event.journal_route = 'ignored'
+        void bot.saveEvents()
+        log('忽略非绑定用户的微信消息')
+        return
       }
+      // One message at a time preserves ordering, including short question replies.
+      triageQueue = triageQueue.then(() => handleMessage(event), () => handleMessage(event))
+      return triageQueue
     },
   })
 
@@ -515,57 +567,147 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => () => bot.stop())
 
-  /**
-   * 即时分诊：消息一到就交给 journal.py 分类入库，并回一句真回执。
-   *
-   * 以前这里是「记下了」三个字，但静默和故障在体感上没法区分——用户不知道
-   * 到底记成了什么。所以改成同步调 triage，由它返回「理解成什么 + 放哪了」。
-   * 判断规则在 journal/RULES.md，不在这份代码里。
-   */
-  const journalDir =
-    typeof config.journalDir === 'string' && config.journalDir.trim()
-      ? config.journalDir.trim()
-      : process.env.JOURNAL_DIR || join(HERE, '..', 'journal')
-
-  async function journalCommand(args) {
+  /** Python validates proposals and returns the result of actual writes. */
+  async function journalCommand(args, input) {
     const python = await resolvePython(pythonOverride)
     if (!python) throw new Error('找不到 Python，账本尚未读取')
-    return new Promise((resolve,reject) => execFile(python,[join(journalDir,'journal.py'),...args],
-      {timeout:120000,windowsHide:true,encoding:'utf8',cwd:journalDir,maxBuffer:8*1024*1024},
-      (error,out,err)=>{if(error)return reject(new Error(err?.trim()||error.message));try{resolve(JSON.parse(out))}catch(e){reject(e)}}))
+    return new Promise((resolve, reject) => {
+      const child = execFile(python, [join(journalDir, 'journal.py'), ...args],
+        { timeout: 120000, windowsHide: true, encoding: 'utf8', cwd: journalDir,
+          env: { ...process.env, JOURNAL_DIR: journalDir }, maxBuffer: 8 * 1024 * 1024 },
+        (error, out, err) => {
+          if (error) return reject(new Error(err?.trim() || error.message))
+          try { resolve(JSON.parse(out)) } catch (parseError) { reject(parseError) }
+        })
+      child.stdin.on('error', reject)
+      child.stdin.end(input === undefined ? undefined : JSON.stringify(input))
+    })
+  }
+
+  async function handleMessage(event) {
+    if (!event.text?.trim()) return
+    if (event.from !== bot.credential?.ilink_user_id) return
+    const key = `wechat:${event.from}`
+    const command = chatCommand(event.text)
+    let recorded = false
+    try {
+      if (command?.action === 'capture') {
+        await chat.dismiss(key)
+        return await captureEvent(event, command.text)
+      }
+      if (command) {
+        event.journal_route = 'command'
+        await bot.saveEvents()
+        if (!chatEnabled && command.action === 'start') {
+          await sendReply('聊天功能尚未开启。仍可发送待办、想法，或使用“/记 具体内容”保存记录。', event)
+          return
+        }
+        const result = await chat.command(key, command.action)
+        await sendReply(command.action === 'stop' && !llm.enabled ? '已退出聊天，当前按规则记录待办和想法。' : result.reply, event)
+        return
+      }
+      if (!llm.enabled) {
+        return await captureEvent(event)
+      }
+      const state = await chat.state(key)
+      if (state.mode === 'chat' && chatEnabled) {
+        event.journal_route = 'chat'
+        await bot.saveEvents()
+        const id = createHash('sha256').update(`${event.from}\0${event.id || event.at}\0${event.text}`).digest('hex')
+        const result = await chat.reply(key, event.text, id)
+        await sendReply(result.reply, event)
+        return
+      }
+      const ev = eventKey(event)
+      // Preserve already registered, version-checked task choices without storing
+      // arbitrary conversation while checking whether this is an old answer.
+      if (!state.pending) {
+        const answer = await journalCommand(['triage', '--text', event.text, '--at', event.at,
+          '--ev', ev, '--check-reply'])
+        if (!answer.needs_classification && answer.receipt) {
+          event.journal_route = 'answer'
+          await bot.saveEvents()
+          await sendReply(answer.receipt, event)
+          return
+        }
+      }
+      const result = await chat.route(key, { ...event, ev }, {
+        allowChat: chatEnabled,
+        validate: ({ ev: ignored, ...plan }) => journalCommand(['triage', '--text', plan.source_messages.map(s => s.text).join('\n'), '--validate-plan'], plan),
+        record: (capture, options) => captureClassified(event, capture, options),
+        reference: sources => collectReferences({ ...event, text: sources.map(s => s.text).join('\n'),
+          urls: sources.flatMap(s => extractUrls(s.text)) }),
+        mark: async route => { event.journal_route = route; await bot.saveEvents() },
+      })
+      recorded = result.recorded
+      await sendReply(result.reply, event)
+      await chat.acknowledge(key, ev)
+    } catch (error) {
+      log(`对话或回执失败：${modelErrorCode(error)}`)
+      try { await sendReply(recorded ? '记录已保存，但未能确认回执是否送达，请在账本中查看。' : chatErrorMessage(error), event) }
+      catch (sendError) { log(`对话失败提示未送达：${sendError.code || sendError.name || 'unknown'}`) }
+    }
+  }
+
+  function eventKey(event) {
+    return 'wx_' + createHash('sha256').update(`${event.from}\0${event.id || event.at + '\0' + event.text}`).digest('hex').slice(0, 24)
+  }
+
+  async function captureClassified(event, capture, { collectRefs = false } = {}) {
+    const { ev, ...plan } = capture
+    const text = plan.source_messages.map(s => s.text).join('\n')
+    event.journal_route = 'capture'
+    event.journal_text = text
+    event.journal_ev = ev
+    event.journal_sources = plan.source_messages
+    await bot.saveEvents()
+    const result = await journalCommand(['triage', '--text', text, '--at', event.at, '--ev', ev, '--plan', '-'], plan)
+    if (!result.duplicate && collectRefs) result.receipt += '\n' + await collectReferences({ ...event, text, urls: extractUrls(text) })
+    return result
+  }
+
+  async function collectReferences(event) {
+    const replies = []
+    const note = event.text.replace(/https?:\/\/\S+/gu, '').trim().slice(0, 1000)
+    for (const url of event.urls || []) {
+      try { replies.push(readingReceipt(await addItem({ url, note, source: 'wechat', acknowledge: false }))) }
+      catch { replies.push(`链接未能加入阅读收件箱：${url}`) }
+    }
+    return replies.join('\n') || '未收到可收藏的链接，未新增资料。'
+  }
+
+  async function captureEvent(event, text = event.text) {
+    event.journal_route = 'capture'
+    event.journal_text = text
+    event.journal_ev = event.id ? 'wx_' + createHash('sha256').update(`${event.from}\0${event.id}`).digest('hex').slice(0, 24) : ''
+    await bot.saveEvents()
+    return captureMessage({ ...event, text, ev: event.journal_ev })
+  }
+
+  async function sendReply(text, event) {
+    if (event.from !== bot.credential?.ilink_user_id) throw new Error('微信绑定用户已变化，未发送旧会话内容')
+    return bot.sendText(text)
+  }
+
+  function captureMessage(event) {
+    const note = event.text.replace(/https?:\/\/\S+/gu, '').trim().slice(0, 1000)
+    for (const url of event.urls || []) {
+      addItem({ url, note, source: 'wechat' }).catch(error => log(`收录失败：${error.code || error.name || 'unknown'}`))
+    }
+    return triage(event)
   }
 
   async function triage(event) {
     if (!event.text || !event.text.trim()) return
-    let stdout = ''
     try {
-      const python = await resolvePython(pythonOverride)
-      if (!python) {
-        log('分诊跳过：找不到 python')
-        return
-      }
-      stdout = await new Promise((resolve, reject) => {
-        execFile(
-          python,
-          [
-            join(journalDir, 'journal.py'),
-            'triage',
-            '--text',
-            event.text,
-            '--at',
-            event.at || new Date().toISOString(),
-          ],
-          { timeout: 20000, windowsHide: true, encoding: 'utf8', cwd: journalDir },
-          (error, out) => (error ? reject(error) : resolve(out)),
-        )
-      })
-      const result = JSON.parse(stdout)
-      if (result && result.receipt) await bot.sendText(result.receipt)
+      const result = await triageMessage(event, journalCommand, llm,
+        () => readFile(join(journalDir, 'RULES.md'), 'utf8'), log)
+      if (result && result.receipt) await sendReply(result.receipt, event)
     } catch (error) {
-      log(`分诊失败：${error.message}${stdout ? ` / ${stdout.slice(0, 200)}` : ''}`)
+      log(`分诊或回执失败：${error.code || error.name || 'unknown'}`)
       // 静默失败最糟：用户以为记下了。至少回一句，别让人等。
       try {
-        await bot.sendText(`这条我没能自动整理（${String(error.message).slice(0, 60)}）。原文留在微信记录里，你说一声我就重试。`)
+        await sendReply('未能确认这条消息的保存结果，请在账本中核对。原文仍保留在微信记录中。', event)
       } catch (sendError) {
         log(`失败回执也没发出去：${sendError.message}`)
       }
@@ -583,13 +725,16 @@ export function apply(ctx, config = {}) {
     const result = await store.mutate((data) => {
       const existing = data.items.find((item) => dedupeKey(item.url) === key)
       if (existing) {
+        let updated = false
+        const restored = existing.status === 'dropped'
         const extraNote = pickString(input.note)
         if (extraNote && !existing.note.includes(extraNote)) {
           existing.note = existing.note ? `${existing.note}\n${extraNote}` : extraNote
+          updated = true
         }
         if (existing.status === 'dropped') existing.status = 'inbox'
         existing.updatedAt = now
-        return { item: compactItem(existing), duplicate: true }
+        return { item: compactItem(existing), duplicate: true, updated, restored }
       }
       const providedTitle = pickString(input.title, 400)
       const item = {
@@ -612,21 +757,19 @@ export function apply(ctx, config = {}) {
       return { item: compactItem(item), duplicate: false }
     })
 
-    if (needsTitle(result.item)) {
-      const titlePromise = enrich(result.item.id, result.item.url, { retries: 2 })
-      if (!result.duplicate && result.item.source === 'wechat') void ackCaptured(titlePromise)
-    } else if (!result.duplicate && result.item.source === 'wechat') {
-      void ackCaptured(Promise.resolve(result.item.title))
-    }
+    const titlePromise = needsTitle(result.item)
+      ? enrich(result.item.id, result.item.url, { retries: 2 })
+      : Promise.resolve(result.item.title)
+    if (input.source === 'wechat' && input.acknowledge !== false) void ackCaptured(titlePromise, result)
+    else void titlePromise.catch(error => log(`资料标题更新失败：${error.code || error.name || 'unknown'}`))
     return result
   }
 
   /** Short WeChat receipt so the user knows the link landed. */
-  async function ackCaptured(titlePromise) {
+  async function ackCaptured(titlePromise, result) {
     try {
       const title = await titlePromise
-      const label = title && title !== '' ? `《${title}》` : '这条链接'
-      await bot.sendText(`已收 ✅ ${label}，周日晚整理。`)
+      await bot.sendText(readingReceipt(result, title))
     } catch (error) {
       log(`回执发送失败：${error.message}`)
     }
@@ -888,7 +1031,8 @@ ${pick}
       schema: { type: 'object', additionalProperties: true },
       render(args, value) {
         const item = value && value.item ? value.item : {}
-        const prefix = value && value.duplicate ? '已在队列中' : '已收录'
+        const prefix = value.restored ? '已恢复到阅读收件箱' : value.updated ? '已补充资料备注'
+          : value.duplicate ? '这条资料已存在，未重复添加' : '已加入阅读收件箱'
         return textBlock(`${prefix}：${item.title || item.url || ''}`)
       },
     },
@@ -978,7 +1122,7 @@ ${pick}
     output: {
       schema: { type: 'object', additionalProperties: true },
       render(args, value) {
-        return textBlock(`已更新：${value.item.title}（${value.item.status}）`)
+        return textBlock(`已更新资料：${value.item.title}（状态：${STATUS_LABELS[value.item.status] || value.item.status}）`)
       },
     },
     async execute(args) {
@@ -1095,7 +1239,7 @@ ${pick}
       render(args, value) {
         if (value.wechat.status === 'connected') return textBlock('微信已连接。')
         if (value.wechat.url) return textBlock(`等待扫码：${value.wechat.url}`)
-        return textBlock(`微信未连接（${value.wechat.status}）`)
+        return textBlock(`微信${WECHAT_STATUS_LABELS[value.wechat.status] || '连接状态未知'}。`)
       },
     },
     async execute() {
@@ -1112,7 +1256,7 @@ ${pick}
       schema: { type: 'object', additionalProperties: true },
       render(args, value) {
         if (value.wechat.url) return textBlock(`把这条链接发到微信里打开：${value.wechat.url}`)
-        return textBlock(`微信当前状态：${value.wechat.status}`)
+        return textBlock(`微信${WECHAT_STATUS_LABELS[value.wechat.status] || '连接状态未知'}。`)
       },
     },
     async execute() {
@@ -1121,10 +1265,51 @@ ${pick}
   })
 
   tool({
+    name: 'reading_journal_llm_status',
+    description: '查看账本 LLM 是否启用、Harness 模型服务是否就绪、最近调用状态。不返回密钥或消息原文。',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: { schema: { type: 'object', additionalProperties: true }, render(args, value) {
+      if (!value.enabled) return textBlock('账本模型已禁用，即时记录使用规则分诊。')
+      if (!value.available) return textBlock('账本模型服务尚未加载。')
+      if (value.route_error) return textBlock(`尚未选定账本模型（${value.route_error}）。`)
+      const recent = value.lastCall ? value.lastCall.ok ? '最近一次模型调用成功。' : `最近一次模型调用失败（${value.lastCall.code || '原因未知'}）。` : '尚无模型调用记录。'
+      const source = value.selection?.source === 'journal-schedule' ? `跟随定时任务「${value.selection.schedule.title}」所属会话。` : ''
+      return textBlock(`已选定模型：${value.route?.provider}/${value.route?.model}。${source}${recent}`)
+    } },
+    async execute() { return { ...await llm.diagnostics(), chat_enabled: chatEnabled } },
+  })
+
+  tool({
+    name: 'reading_journal_review',
+    description: '调用 Harness 已配置的 LLM 做晚间收口或周报分析，校验逐字引用，返回整理建议、本子回应和现有任务的下一步。不会自动修改项目、完成任务或推送微信。必须继续 coverage.next_offset 分页，partial_source_ids 需核对完整来源；建议通过现有 evidence / notebook-review 命令保存。',
+    parameters: { type: 'object', properties: {
+      mode: { type: 'string', enum: ['daily', 'weekly'] },
+      offset: { type: 'integer', minimum: 0 },
+      limit: { type: 'integer', minimum: 1, maximum: 30 },
+    }, required: ['mode'], additionalProperties: false },
+    output: { schema: { type: 'object', additionalProperties: true }, render() { return textBlock('已生成整理建议，尚未写入账本。确认后须另行保存。') } },
+    async execute(args) {
+      if (!['daily', 'weekly'].includes(args?.mode)) throw new Error('mode 必须为 daily 或 weekly')
+      const offset = args.offset ?? 0
+      const limit = args.limit ?? 6
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 30) throw new Error('分页参数无效')
+      const context = await journalCommand(['context', '--offset', String(offset), '--limit', String(limit)])
+      const snapshot = await journalCommand(['notebook-review'])
+      const notebook = Object.fromEntries(['hash', 'pending', 'latest', 'responses', 'notebook', 'sections'].map(key => [key, snapshot[key]]))
+      const rules = await readFile(join(journalDir, 'RULES.md'), 'utf8')
+      // Only first page proposes notebook responses; later pages still read its context.
+      if (offset > 0) notebook.pending = false
+      const result = await llm.review(context, notebook, rules, args.mode)
+      if (!notebook.pending) result.notebook_responses = []
+      return result
+    },
+  })
+
+  tool({
     name: 'reading_journal_context',
     description: '晚间收口或周报必须先调用。读取本子、项目、待答问题、工作区变化和文献快照。证据只表示观察，不等于进展；按 journal/RULES.md 处理并引用来源。若 next_offset 非空，继续分页。',
     parameters: {type:'object',properties:{offset:{type:'integer',minimum:0}},additionalProperties:false},
-    output: {schema:{type:'object',additionalProperties:true},render(){return textBlock('已读取工作台来源与待核对记录。')}},
+    output: {schema:{type:'object',additionalProperties:true},render(args,value){return textBlock(`已读取本页 ${value.evidence?.length || 0} 条待核对来源。${value.next_offset !== null ? '还有来源未返回，请继续分页。' : '已到最后一页。'}`)}},
     execute(args){return journalCommand(['context','--offset',String(args?.offset||0)])},
   })
 
@@ -1140,8 +1325,10 @@ ${pick}
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
-      render() {
-        return textBlock('已发回微信。')
+      render(args, value) {
+        return textBlock(value?.question_activated === false
+          ? '消息已发送到微信，但问题回复识别未启用。请重试启用问题，不要重复发送消息。'
+          : '消息已发送到微信。')
       },
     },
     async execute(args) {
@@ -1211,13 +1398,28 @@ ${pick}
     const url = new URL(req.url || '/', 'http://127.0.0.1')
     const path = url.pathname
     try {
+      if (req.method === 'GET' && path === '/reading-inbox/api/llm/status') {
+        return sendJson(res, 200, { ...await llm.diagnostics(), chat_enabled: chatEnabled })
+      }
+      if (req.method === 'POST' && path === '/reading-inbox/api/llm/probe') {
+        if (!(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
+          return sendJson(res, 415, { error: '需要 application/json 请求' })
+        }
+        if (req.headers.origin && req.headers.origin !== ctx.webServer.getOrigin()) {
+          return sendJson(res, 403, { error: '仅允许本机应用来源' })
+        }
+        await readBody(req, 1024)
+        // Fixed, non-personal input: no notebook, chat history or WeChat send.
+        const result = await llm.chat({ text: '连接测试，请只回复“连接正常”。', history: [], journal: {}, timezone: 'Asia/Shanghai' })
+        return sendJson(res, 200, { ok: true, ...result })
+      }
       if (req.method === 'GET' && path === '/reading-inbox/api/state') {
         const state = await store.read((data) => ({
           items: sortItems(data.items).map(compactItem),
           digests: data.digests,
           counts: countsOf(data.items),
         }))
-        return sendJson(res, 200, { ...state, wechat: bot.snapshot(), ui })
+        return sendJson(res, 200, { ...state, wechat: bot.snapshot(), ui, llm: llm.status })
       }
 
       if (req.method === 'GET' && path === '/reading-inbox/api/debug') {

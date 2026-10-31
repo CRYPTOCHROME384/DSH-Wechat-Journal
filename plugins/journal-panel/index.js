@@ -130,14 +130,12 @@ export function apply(ctx, config = {}) {
       case 'project.add': {
         const name = str(body.name, 60)
         if (!name) throw new Error('项目名不能为空')
-        await run(['project', 'add', '--name', name])
-        return true
+        return JSON.parse(await run(['project', 'add', '--name', name]))
       }
       case 'project.remove': {
         const id = str(body.id, 40)
         if (!id) throw new Error('缺少项目 id')
-        await run(['project', 'remove', '--id', id])
-        return true
+        return JSON.parse(await run(['project', 'remove', '--id', id]))
       }
       case 'project.set': {
         const id = str(body.id, 40)
@@ -147,8 +145,7 @@ export function apply(ctx, config = {}) {
           if (typeof body[field] === 'string') args.push(`--${field}`, body[field])
         }
         if (str(body.name, 60)) args.push('--name', str(body.name, 60))
-        await run(args)
-        return true
+        return JSON.parse(await run(args))
       }
       case 'item.add': {
         const type = str(body.type, 10) || 'task'
@@ -158,8 +155,7 @@ export function apply(ctx, config = {}) {
         if (str(body.project, 40)) args.push('--project', str(body.project, 40))
         if (str(body.due, 40)) args.push('--due', str(body.due, 40))
         if (str(body.at, 80)) args.push('--at', str(body.at, 80))
-        await run(args)
-        return true
+        return JSON.parse(await run(args))
       }
       case 'item.set': {
         const id = str(body.id, 40)
@@ -178,14 +174,12 @@ export function apply(ctx, config = {}) {
         else if (Object.hasOwn(body, 'at')) args.push(`--at-json=${JSON.stringify(body.at)}`)
         if (typeof body.place === 'string') args.push(`--place=${body.place}`)
         if (typeof body.project === 'string') args.push(`--project=${body.project}`)
-        await run(args)
-        return true
+        return JSON.parse(await run(args))
       }
       case 'idea.promote': {
         const id = str(body.id, 40)
         if (!id) throw new Error('缺少想法 id')
-        await run(['promote', '--id', id])
-        return true
+        return JSON.parse(await run(['promote', '--id', id]))
       }
       case 'sources.scan': {
         await run(['sources', 'scan'])

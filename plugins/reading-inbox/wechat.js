@@ -56,7 +56,7 @@ function isTimeout(error) {
   return error && (error.name === 'TimeoutError' || error.name === 'AbortError')
 }
 
-function extractUrls(text) {
+export function extractUrls(text) {
   if (typeof text !== 'string') return []
   const found = text.match(URL_RE) || []
   return [...new Set(found.map((url) => url.replace(/[.,;:!?]+$/u, '')))]
@@ -86,6 +86,7 @@ export class WeChatBot {
     this.listenTask = null
     this.events = []
     this.eventsWrite = Promise.resolve()
+    this.contextTokens = new Map()
     this.status = 'idle'
     this.error = ''
     this.lastMessageAt = 0
@@ -265,9 +266,14 @@ export class WeChatBot {
   }
 
   handleMessage(msg) {
+    if (msg.from_user_id === this.credential?.ilink_user_id && typeof msg.context_token === 'string' && msg.context_token) {
+      this.contextTokens.set(msg.from_user_id, msg.context_token)
+    }
     const text = messageText(msg)
     const urls = extractUrls(text)
     const event = {
+      id: String(msg.message_id || msg.client_id || ''),
+      journal_route: 'pending',
       at: new Date().toISOString(),
       from: msg.from_user_id || '',
       type: msg.message_type,
@@ -280,7 +286,7 @@ export class WeChatBot {
     if (this.events.length > 100) this.events.shift()
     void this.saveEvents()
     try {
-      this.onMessage(event, msg)
+      return this.onMessage(event, msg)
     } catch (error) {
       this.log(`处理微信消息失败：${error && error.message}`)
     }
@@ -290,7 +296,7 @@ export class WeChatBot {
     if (!this.credential || !this.credential.bot_token) throw new Error('微信未连接')
     const to = this.credential.ilink_user_id
     if (!to) throw new Error('缺少微信用户 id，请重新扫码接入')
-    return postJson(
+    const result = await postJson(
       '/ilink/bot/sendmessage',
       {
         msg: {
@@ -299,16 +305,22 @@ export class WeChatBot {
           client_id: `dsh-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
           message_type: 2,
           message_state: 2,
+          ...(this.contextTokens.get(to) ? { context_token: this.contextTokens.get(to) } : {}),
           item_list: [{ type: 1, text_item: { text } }],
         },
         base_info: { channel_version: CHANNEL_VERSION, bot_agent: 'DSH' },
       },
       { token: this.credential.bot_token, timeoutMs: 30000 },
     )
+    if ((result.ret !== undefined && result.ret !== 0) || (result.errcode !== undefined && result.errcode !== 0)) {
+      throw Object.assign(new Error('微信未接受这条消息'), { code: 'WECHAT_SEND_FAILED' })
+    }
+    return result
   }
 
   async clearCredential() {
     this.credential = null
+    this.contextTokens.clear()
     try {
       await rm(this.stateFile, { force: true })
     } catch {

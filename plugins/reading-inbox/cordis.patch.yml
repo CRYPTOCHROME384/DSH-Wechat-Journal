@@ -6,3 +6,12 @@
       config:
         dataDir: ''
         # journalDir: ''   # 省略则用 reading-inbox 同级的 journal/
+        chat:
+          enabled: true
+        llm:
+          enabled: true
+          # 默认跟随账本定时任务所属会话的模型；无任务时自动选择可用模型。
+          # provider: '已在 Harness 配置的 provider id'
+          # model: '已在 Harness 配置的 model id'
+          # timeoutMs: 45000
+          # maxInputBytes: 240000
