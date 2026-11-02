@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, symlinkSync, readlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -30,6 +30,10 @@ test('installer: dry-run, quoted paths, Python config, idempotence and data pres
   assert.equal(pythonLines.length, 2)
   for (const line of pythonLines) assert.equal(JSON.parse(line.split('python:')[1]), python.replace(/\\/g, '/'))
   assert.ok(patch.includes(JSON.stringify(data.replace(/\\/g, '/'))))
+  assert.ok(patch.includes('enabled: true'))
+  assert.ok(existsSync(join(data, 'journal_llm.py')))
+  const ready = readFileSync(join(data, '..', 'schedules-ready.md'), 'utf8')
+  assert.ok(ready.includes('reading_journal_review'))
   const notebook = join(data, 'notebook.md')
   writeFileSync(notebook, 'My own notes\n')
   run(process.execPath, args, { DSH_HOME: temp })
@@ -46,4 +50,14 @@ test('installer: dry-run, quoted paths, Python config, idempotence and data pres
   journal('triage', '--text', '明天完成示例报告', '--at', '2026-10-30T12:00:00+08:00', '--ev', 'test-event')
   assert.equal(journal('state').items.length, first.items.length)
   assert.equal(readFileSync(notebook, 'utf8'), 'My own notes\n')
+  const pluginLink = join(profile, 'node_modules', '@local', 'reading-inbox')
+  unlinkSync(pluginLink)
+  symlinkSync(join(temp, 'old-checkout'), pluginLink, process.platform === 'win32' ? 'junction' : 'dir')
+  run(process.execPath, [...args, '--dry-run'], { DSH_HOME: temp })
+  assert.equal(readlinkSync(pluginLink), join(temp, 'old-checkout'))
+  run(process.execPath, [...args, '--llm-provider', 'configured', '--llm-model', 'selected'], { DSH_HOME: temp })
+  assert.equal(readlinkSync(pluginLink), join(repo, 'plugins', 'reading-inbox'))
+  assert.ok(readFileSync(join(profile, 'cordis.patch.yml'), 'utf8').includes('model: "selected"'))
+  run(process.execPath, [...args, '--no-llm'], { DSH_HOME: temp })
+  assert.ok(readFileSync(join(profile, 'cordis.patch.yml'), 'utf8').includes('enabled: false'))
 })

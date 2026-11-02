@@ -42,20 +42,46 @@ def previous_record(saved, entry):
 
 def browse(data, root=''):
     config = read_json(data / 'sources.json', {})
-    base = Path(config.get('workspace') or data).resolve()
-    path = Path(root).resolve() if root else base
-    if not path.is_relative_to(base):
-        raise ValueError('只能浏览配置的工作区内目录')
-    for part in [path, *path.parents]:
-        if part == base.parent: break
-        if part.is_symlink() or getattr(part.lstat(), 'st_file_attributes', 0) & 1024:
-            raise ValueError('不浏览目录链接')
+    home = Path.home().resolve()
+    workspace = Path(config['workspace']).expanduser().resolve() if config.get('workspace') else None
+    # Workspace config controls discovery, not which directories users can bind.
+    base = workspace if workspace and workspace.is_dir() else home
+    candidate = Path(root.strip()).expanduser() if root.strip() else base
+    if not candidate.is_absolute():
+        raise ValueError('请输入完整目录路径，或使用 ~ 表示用户目录')
+    path = candidate.resolve()
+    if not path.is_dir():
+        raise ValueError('目录不存在或不可访问，请检查路径')
     children = []
-    for child in sorted(path.iterdir()):
-        if child.name.startswith('.') or child.name.lower() in SKIP: continue
-        if child.is_dir() and not child.is_symlink() and not getattr(child.lstat(), 'st_file_attributes', 0) & 1024:
-            children.append({'name': child.name, 'root': str(child)})
-    return {'root':str(path), 'parent':str(path.parent) if path != base else None, 'children':children}
+    try:
+        for child in sorted(path.iterdir(), key=lambda p: (p.name.casefold(), p.name)):
+            if child.name.startswith('.') or child.name.lower() in SKIP:
+                continue
+            try:
+                if child.is_dir() and not child.is_symlink() and not getattr(child.lstat(), 'st_file_attributes', 0) & 1024:
+                    children.append({'name': child.name, 'root': str(child)})
+            except OSError:
+                continue
+    except OSError as error:
+        raise ValueError('无法读取此目录，请检查目录访问权限') from error
+    shortcuts = []
+    def shortcut(name, target):
+        try:
+            if target.is_dir() and not any(s['root'] == str(target) for s in shortcuts):
+                shortcuts.append({'name': name, 'root': str(target)})
+        except OSError:
+            pass
+    shortcut('用户目录', home)
+    if workspace:
+        shortcut('工作区', workspace)
+    if os.name == 'nt':
+        for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+            shortcut(letter + ':', Path(letter + ':/'))
+    else:
+        shortcut('根目录', Path('/'))
+        shortcut('外接磁盘', Path('/Volumes'))
+    return {'root': str(path), 'parent': str(path.parent) if path != path.parent else None,
+            'children': children, 'shortcuts': shortcuts}
 
 def bind(data, pid, root, project_ids, remove=False):
     if pid not in project_ids:

@@ -21,6 +21,7 @@ from __future__ import annotations
 import journal_notebook
 import journal_sources
 import journal_evidence
+import journal_llm
 
 import argparse
 import datetime as dt
@@ -506,10 +507,14 @@ def cmd_ingest(args) -> None:
 
     fresh = []
     for event in events:
-        text = (event.get("text") or "").strip()
+        # New plugin versions explicitly route conversations away from the ledger.
+        # Unrouted messages remain in the raw WeChat cache, never guessed into tasks.
+        if event.get('journal_route') not in (None, 'capture'):
+            continue
+        text = (event.get('journal_text', event.get("text")) or "").strip()
         if not text:
             continue
-        key = ev_hash(event.get("at", ""), text)
+        key = event.get("journal_ev") or ev_hash(event.get("at", ""), text)
         if key in seen:
             continue
         seen.add(key)
@@ -522,8 +527,9 @@ def cmd_ingest(args) -> None:
         if urls and len(rest) < 2:
             continue
         hint = "task" if TIME_RE.search(rest or text) else "idea"
-        fresh.append({"at": event.get("at"), "text": rest or text, "urls": urls,
-                      "ev": key, "hint": hint})
+        fresh.append({"at": event.get("at"), "text": text if event.get('journal_sources') else rest or text, "urls": urls,
+                      "ev": key, "hint": hint,
+                      **({'source_messages': event['journal_sources']} if event.get('journal_sources') else {})})
 
     if fresh:
         for row in fresh:
@@ -566,18 +572,21 @@ def split_clauses(text: str) -> list[str]:
     return merged or ([text.strip()] if text.strip() else [])
 
 
-def build_multi_receipt(items: list[dict], data: dict) -> str:
-    lines = [f"记了 {len(items)} 处："]
+def build_multi_receipt(items: list[dict], data: dict, duplicate: bool = False) -> str:
+    if not items:
+        return '原文已保存，未新增待办或想法。'
+    if duplicate:
+        head = '这条消息已处理，未重复添加：'
+    else:
+        tasks = sum(i['type'] == 'task' for i in items)
+        ideas = sum(i['type'] == 'idea' for i in items)
+        results = ([f'已加入 {tasks} 条待办'] if tasks else []) + ([f'已保存 {ideas} 条想法'] if ideas else [])
+        head = '，'.join(results) + '：'
+    lines = [head]
     for item in items:
-        project = find_project(data, item.get("project"))
-        tag = f"（{project['name']}）" if project else ""
-        if item["type"] == "idea":
-            lines.append(f"· 想法：{item['text']}{tag}")
-            continue
-        when = short_when(item)
-        head = f"{when} · " if when else ""
-        lines.append(f"· {head}{item['text']}{tag}")
-    return "\n".join(lines)
+        project = find_project(data, item.get('project'))
+        lines.append('· ' + build_receipt(item, project['name'] if project else None, duplicate=duplicate))
+    return '\n'.join(lines)
 
 
 def extract_when(text: str):
@@ -655,21 +664,43 @@ def clash_with(data: dict, item: dict) -> dict | None:
     return None
 
 
-def build_receipt(item: dict, project_name: str | None, clash: dict | None = None) -> str:
-    body = item["text"]
-    tail = ""
+def receipt_description(item: dict, project_name: str | None = None) -> str:
+    details = []
+    if item.get('at'):
+        details.append('时间：' + at_label(item['at']))
+    if item.get('due'):
+        details.append('截止：' + due_label(item['due']))
+    if item.get('place'):
+        details.append('地点：' + item['place'])
+    if project_name:
+        details.append('项目：' + project_name)
+    body = item['text'].rstrip('。')
+    return body + ('（' + '；'.join(details) + '）' if details else '')
+
+
+def build_receipt(item: dict, project_name: str | None, clash: dict | None = None, duplicate: bool = False) -> str:
+    kind = item['type']
+    if duplicate:
+        state = item.get('status')
+        if kind == 'task':
+            prefix = {'done': '该任务已完成', 'parked': '该待办已暂缓', 'dropped': '该待办已放弃'}.get(state, '这条待办已存在')
+        else:
+            prefix = {'promoted': '该想法已标记为已转任务', 'parked': '该想法已暂缓', 'dropped': '该想法已放弃'}.get(state, '这条想法已保存')
+        prefix += '，未重复添加'
+    else:
+        prefix = '已加入待办' if kind == 'task' else '已保存想法'
+    receipt = prefix + '：' + receipt_description(item, project_name) + '。'
     if clash:
-        tail = f"\n那天还有「{clash['text']}」，别撞。"
-    if item["type"] == "idea":
-        where = f"挂在{project_name}下面" if project_name else "先放着"
-        return f"记进想法了：{body}。{where}。{tail}"
-    where = f"挂在{project_name}下面" if project_name else "先在悬着"
-    when = short_when(item)
-    if item.get("at"):
-        return f"{when} · {body}。{where}。{tail}"
-    if item.get("due"):
-        return f"{when}做完：{body}。{where}。{tail}"
-    return f"任务：{body}。{where}。{tail}"
+        receipt += '\n同一天还有记录：' + receipt_description(clash) + '。'
+    return receipt
+
+
+def repeated_receipt(data: dict, ev: str) -> str:
+    items = [i for i in data['items'] if i.get('ev') == ev]
+    if len(items) == 1:
+        project = find_project(data, items[0].get('project'))
+        return build_receipt(items[0], project['name'] if project else None, duplicate=True)
+    return build_multi_receipt(items, data, duplicate=True)
 
 
 def capture_has(ev: str) -> bool:
@@ -789,16 +820,9 @@ def build_announcement(raw: str, ev: str, stamp: str) -> list[dict]:
 
 
 def build_announce_receipt(items: list[dict]) -> str:
-    event = items[0] if items else None
-    lines = []
-    if event and event.get("at"):
-        when = short_when(event)
-        place = f" @{event['place']}" if event.get("place") else ""
-        lines.append(f"通知记下了：{when} · {event['text']}{place}")
-    extras = [i for i in items if i is not event]
-    if extras:
-        lines.append("另外加了两件：" + "、".join(i["text"] for i in extras))
-    return "\n".join(lines)
+    if len(items) == 1:
+        return build_receipt(items[0], None)
+    return build_multi_receipt(items, {'projects': []})
 
 
 _NOISE = set("的了是我你他它这那就也都还在有和与吧吗呢啊呀个上下一不没很又再才把被让给对从到")
@@ -931,6 +955,11 @@ def cmd_triage(args) -> None:
     data = load()
     raw = (args.text or "").strip()
     reply = {"ok": True, "created": None, "receipt": ""}
+    if args.validate_plan:
+        plan = json.load(sys.stdin)
+        journal_llm.validate(plan, raw, data['projects'])
+        print(json.dumps({'ok': True}))
+        return
     if not raw:
         print(json.dumps(reply, ensure_ascii=False))
         return
@@ -938,26 +967,30 @@ def cmd_triage(args) -> None:
     urls = URL_RE.findall(raw)
     rest = BOILER_RE.sub("", URL_RE.sub("", raw)).strip()
     # 纯链接归碎片阅读服务，这边不出声（免得一次发送两条回执）
-    if urls and not TIME_RE.search(rest):
+    if urls and not rest:
         print(json.dumps(reply, ensure_ascii=False))
         return
 
     ev = args.ev or ev_hash(args.at or "", raw)
+    previous = data.get('llm_triage', {}).get(ev)
+    if previous:
+        print(json.dumps({**previous, 'duplicate': True, 'receipt': repeated_receipt(data, ev)}, ensure_ascii=False))
+        return
     answered = next((p for p in data.get('pending', []) if p.get('answer_ev') == ev), None)
     if answered:
-        print(json.dumps({'ok':True,'duplicate':True,'answered':answered['id'],'receipt':answered.get('receipt','这条答复已经记下了。')},ensure_ascii=False))
+        print(json.dumps({'ok':True,'duplicate':True,'answered':answered['id'],'receipt':'这条答复已保存，未重复处理。'},ensure_ascii=False))
         return
     existing = next((i for i in data["items"] if i.get("ev") == ev), None)
-    if not existing and len(active_questions(data)) > 1 and raw.strip('。！! ') in ('对','是','是的','不是','好','好的','先不做','第一个','第二个','第三个','1','2','3'):
+    if not args.plan and not existing and len(active_questions(data)) > 1 and raw.strip('。！! ') in ('对','是','是的','不是','好','好的','先不做','第一个','第二个','第三个','1','2','3'):
         if not capture_has(ev):
             capture_append({'at':args.at or iso(),'text':raw,'urls':[],'ev':ev,'kind':'answer_uncertain'})
         questions = active_questions(data)
-        print(json.dumps({'ok':True,'receipt':'我这里还有不止一个问题待确认。你指的是哪件事？可以带上任务名再回一句。','uncertain':True},ensure_ascii=False))
+        print(json.dumps({'ok':True,'receipt':'答复原文已保存，但尚未修改任务：有多个待确认问题。请带上任务名或问题内容再回复。','uncertain':True},ensure_ascii=False))
         return
 
     # 有没答的待判时，短文本可能是在回答。但**必须字面真的对上**：
     # 光"没有时间词"远远不够，否则一句「仓库还要优化」会被当成回答问题的答案。
-    if not existing and not urls and data.get("pending") and len(raw) <= 80:
+    if not args.plan and not existing and not urls and data.get("pending") and len(raw) <= 80:
         target, score, ratio = match_pending(data, raw)
         if target and score >= 2 and ratio >= 0.2:
             target["answered"] = True
@@ -969,7 +1002,7 @@ def cmd_triage(args) -> None:
                 capture_append({"at": args.at or iso(), "text": rest or raw, "urls": [],
                                 "ev": ev, "kind": "answer"})
             head = target["question"][:24]
-            receipt = f'明白，你对「{head}」的答复是：{raw}。已记下，具体调整还待核对。'
+            receipt = f'已保存答复：{raw}（对应问题：{head}）。任务尚未修改，待核对。'
             short = raw.strip().strip('。！!，, ')
             choices = target.get('choices', [])
             index = {'第一个':0,'第二个':1,'第三个':2,'1':0,'2':1,'3':2}.get(short)
@@ -980,10 +1013,11 @@ def cmd_triage(args) -> None:
                     stamp = iso()
                     item.setdefault('history',[]).append({'at':stamp,'field':'status','from':item['status'],'to':choice['status'],'answer_ev':ev})
                     item.update(status=choice['status'],updated=stamp)
-                    receipt = f'好，「{item["text"]}」已按你的选择改为「{choice["label"]}」。'
+                    label = {'open':'待办','done':'已完成','parked':'已暂缓','dropped':'已放弃','new':'已保存','promoted':'已转为任务'}[choice['status']]
+                    receipt = f'已更新状态：「{item["text"]}」→ {label}。'
                     target['applied'] = True
                 else:
-                    receipt = '你的选择已记下。不过这条任务刚被修改过，我没有覆盖，需要核对最新状态。'
+                    receipt = '已保存你的选择，但未修改任务：任务已在其他地方更新，请核对最新状态。'
             target['receipt'] = receipt
             save(data)
             render(data)
@@ -994,7 +1028,57 @@ def cmd_triage(args) -> None:
     if existing:
         project = find_project(data, existing.get("project"))
         reply.update(created=existing["id"], duplicate=True,
-                     receipt=build_receipt(existing, project["name"] if project else None))
+                     receipt=repeated_receipt(data, ev))
+        print(json.dumps(reply, ensure_ascii=False))
+        return
+
+    if args.check_reply:
+        print(json.dumps({'needs_classification': True}))
+        return
+    if args.prepare:
+        if not capture_has(ev):
+            capture_append({'at': args.at or iso(), 'text': raw, 'urls': urls, 'ev': ev})
+        print(json.dumps({'needs_llm': True, 'ev': ev, 'text': raw,
+                          'received_at': args.at or iso(), 'timezone': 'Asia/Shanghai',
+                          'projects': project_list(data)}, ensure_ascii=False))
+        return
+    if args.plan:
+        plan = json.load(sys.stdin) if args.plan == '-' else json.loads(Path(args.plan).read_text(encoding='utf-8-sig'))
+        proposals, model = journal_llm.validate(plan, raw, data['projects'])
+        stamp = iso()
+        created = []
+        for index, proposal in enumerate(proposals):
+            kind = proposal['type']
+            created.append({
+                'id': new_id('t' if kind == 'task' else 'k'), 'type': kind,
+                'text': proposal['text'], 'note': proposal['note'],
+                'project': proposal['project'], 'status': 'open' if kind == 'task' else 'new',
+                'due': proposal['due'], 'due_raw': proposal['time_quote'] if proposal['due'] else None,
+                'at': proposal['at'], 'at_raw': proposal['time_quote'] if proposal['at'] else None,
+                'place': proposal['place'], 'created': stamp, 'updated': stamp,
+                'source': 'wechat', 'ev': ev, 'ev_part': index, 'llm': model,
+                'quote': proposal['quote'],
+                'history': [{'at': stamp, 'field': 'text', 'from': raw, 'to': proposal['text'], 'by': 'llm'}],
+            })
+        if not capture_has(ev):
+            capture_append({'at': args.at or stamp, 'text': raw, 'urls': urls, 'ev': ev,
+                            **({'source_messages': plan['source_messages']} if 'source_messages' in plan else {})})
+        data['items'].extend(created)
+        data['cursor']['lastIngestAt'] = stamp
+        receipt = ''
+        if len(created) == 1:
+            project = find_project(data, created[0]['project'])
+            receipt = build_receipt(created[0], project['name'] if project else None,
+                                    clash_with({'items': [i for i in data['items'] if i.get('ev') != ev]}, created[0]))
+        elif created:
+            receipt = build_multi_receipt(created, data)
+        elif not urls:
+            receipt = '原文已保存，未新增待办或想法。'
+        reply.update(created=created[0]['id'] if created else None, ids=[i['id'] for i in created],
+                     receipt=receipt, engine='llm', model=model)
+        data.setdefault('llm_triage', {})[ev] = reply
+        save(data)
+        render(data)
         print(json.dumps(reply, ensure_ascii=False))
         return
 
@@ -1325,7 +1409,7 @@ def cmd_project(args) -> None:
         if not target:
             raise SystemExit("找不到这个项目")
         data["projects"] = [p for p in data["projects"] if p["id"] != target["id"]]
-        # 项目删了，条目不能跟着消失：掉回「悬着」，历史留痕
+        # 项目删了，条目不能跟着消失：解除项目关联，历史留痕
         moved = 0
         for it in data["items"]:
             if it.get("project") == target["id"]:
@@ -1394,7 +1478,7 @@ def render(data: dict | None = None) -> None:
 
     loose = [t for t in tasks if not t.get("project") and t["status"] in ("open", "parked")]
     if loose:
-        lines.append("## 悬着")
+        lines.append("## 未关联项目的待办")
         for t in sorted(loose, key=lambda x: (when_key(x), x["created"])):
             when = when_label(t)
             lines.append(f"- {t['text']}" + (f" — {when}" if when else ""))
@@ -1550,6 +1634,7 @@ def cmd_notebook_review(args):
     state = notebook_review_state()
     if not args.file:
         print(json.dumps({**state, "notebook": (DATA / "notebook.md").read_text(encoding="utf-8-sig") if (DATA / "notebook.md").exists() else "",
+                          "sections": journal_notebook.snapshot(DATA)["sections"],
                           "projects": project_list(load()), "items": load()["items"], "file_sources": journal_sources.scan(DATA, {p["id"] for p in load()["projects"]})}, ensure_ascii=False))
         return
     entry = json.loads(Path(args.file).read_text(encoding="utf-8-sig"))
@@ -1595,8 +1680,8 @@ def cmd_context(args):
         'pending_questions': data['pending'], 'notebook_review': notebook_review_state(),
         'sources': [{k:v for k,v in s.items() if k != 'events'} for s in journal_sources.status(DATA)], 'notion': journal_evidence.overview(DATA,data)['notion'],
         'external_sources': journal_evidence.overview(DATA,data)['handoff'],
-        'evidence': [journal_evidence.batch_context(data,r) for r in pending[offset:offset+30]], 'total': len(pending),
-        'next_offset': offset+30 if offset+30 < len(pending) else None}, ensure_ascii=False))
+        'evidence': [journal_evidence.batch_context(data,r) for r in pending[offset:offset+args.limit]], 'total': len(pending),
+        'next_offset': offset+args.limit if offset+args.limit < len(pending) else None}, ensure_ascii=False))
 
 
 def cmd_evidence(args):
@@ -1638,6 +1723,14 @@ def cmd_notebook_day(args):
     except ValueError as error:
         raise SystemExit(str(error))
     print(json.dumps({"ok": True}))
+
+
+def cmd_chat_context(_args) -> None:
+    """Read-only snapshot for conversation: no scans, collection or journal writes."""
+    data = load()
+    print(json.dumps({'projects': project_list(data), 'items': data['items'],
+                      'notebook': (DATA / 'notebook.md').read_text(encoding='utf-8-sig')
+                      if (DATA / 'notebook.md').exists() else ''}, ensure_ascii=False))
 
 
 def cmd_state(_args) -> None:
@@ -1768,11 +1861,17 @@ def main() -> None:
     p.add_argument("--text", required=True)
     p.add_argument("--at", default="")
     p.add_argument("--ev", default="")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--prepare', action='store_true', help='保存原文并返回 LLM 分诊上下文')
+    mode.add_argument('--check-reply', action='store_true', help='只检查已有答复和重复消息，不新增记录')
+    mode.add_argument('--validate-plan', action='store_true', help='从 stdin 校验提议，不保存记录')
+    mode.add_argument('--plan', default='', help='经过校验的 LLM JSON 提议；- 表示 stdin')
     p.set_defaults(fn=cmd_triage)
 
     sub.add_parser("render").set_defaults(fn=cmd_render)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("state").set_defaults(fn=cmd_state)
+    sub.add_parser("chat-context").set_defaults(fn=cmd_chat_context)
     p = sub.add_parser("sources")
     p.add_argument("action", choices=("scan", "status", "bind", "unbind", "browse"))
     p.add_argument('--id', default='')
@@ -1780,6 +1879,7 @@ def main() -> None:
     p.set_defaults(fn=cmd_sources)
     p = sub.add_parser('context')
     p.add_argument('--offset', type=int, default=0)
+    p.add_argument('--limit', type=int, choices=range(1, 31), default=30)
     p.set_defaults(fn=cmd_context)
     p = sub.add_parser('evidence')
     p.add_argument('--file', required=True)

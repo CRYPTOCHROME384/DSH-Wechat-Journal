@@ -13,6 +13,8 @@
   "files": [
     "index.js",
     "wechat.js",
+    "llm.js",
+    "chat.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",

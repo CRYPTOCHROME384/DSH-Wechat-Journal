@@ -15,7 +15,7 @@
  *   node install.mjs --profile myprofile
  *   node install.mjs --dry-run           # 只打印将要做的事
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, symlinkSync, lstatSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, symlinkSync, lstatSync, readlinkSync, unlinkSync, readdirSync } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -26,13 +26,16 @@ const BLOCK_START = '# >>> dsh-journal installer >>>'
 const BLOCK_END = '# <<< dsh-journal installer <<<'
 
 function parseArgs(argv) {
-  const out = { data: '', profile: 'desktop', dry: false, python: 'python' }
+  const out = { data: '', profile: 'desktop', dry: false, python: 'python', llm: true, provider: '', model: '' }
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]
     if (a === '--dry-run') out.dry = true
     else if (a === '--data') out.data = argv[++i] || ''
     else if (a === '--profile') out.profile = argv[++i] || 'desktop'
     else if (a === '--python') out.python = argv[++i] || 'python'
+    else if (a === '--no-llm') out.llm = false
+    else if (a === '--llm-provider') out.provider = argv[++i] || ''
+    else if (a === '--llm-model') out.model = argv[++i] || ''
     else if (a === '--help' || a === '-h') {
       console.log(readFileSync(join(HERE, 'INSTALL.md'), 'utf8'))
       process.exit(0)
@@ -55,6 +58,8 @@ const fail = (msg) => {
 }
 // Windows 编辑器经常写入 BOM，JSON.parse / YAML 都不认，读的时候先剥掉
 const readText = (path) => readFileSync(path, 'utf8').replace(/^\uFEFF/, '')
+
+if (Boolean(args.provider) !== Boolean(args.model)) fail('--llm-provider 与 --llm-model 必须同时填写')
 
 if (!existsSync(join(profileDir, 'package.json'))) {
   fail(`找不到 DSH profile：${profileDir}\n  先确认 DSH 装好并至少启动过一次，或用 --profile 指定名称。`)
@@ -107,7 +112,7 @@ if (!existsSync(rulesDst)) {
 
 // journal.py 及其模块也放进数据目录：插件按「数据目录里有 journal.py」调用，
 // 这样整个数据目录是自包含的，搬机器/备份只需要搬一个文件夹。
-const pyFiles = ['journal.py', 'journal_evidence.py', 'journal_sources.py', 'journal_notebook.py', 'journal_handoff.py']
+const pyFiles = ['journal.py', 'journal_evidence.py', 'journal_sources.py', 'journal_notebook.py', 'journal_handoff.py', 'journal_llm.py']
 let copied = 0
 for (const file of pyFiles) {
   const src = join(HERE, 'journal', file)
@@ -147,15 +152,24 @@ if (!args.dry) mkdirSync(nmLocal, { recursive: true })
 for (const name of PLUGINS) {
   const target = join(HERE, 'plugins', name)
   const linkPath = join(nmLocal, name)
-  let exists = false
+  let linkStat
   try {
-    lstatSync(linkPath)
-    exists = true
+    linkStat = lstatSync(linkPath)
   } catch {
-    exists = false
+    linkStat = null
   }
-  if (exists) {
-    log(`  ${name} 已存在，跳过`)
+  if (linkStat) {
+    if (!linkStat.isSymbolicLink()) fail(`${linkPath} 已存在且不是链接，请先移走后重新安装。`)
+    if (resolve(dirname(linkPath), readlinkSync(linkPath)) === resolve(target)) {
+      log(`  ${name} 已存在，跳过`)
+      continue
+    }
+    // A previous checkout may still own the link after moving/cloning the repo.
+    if (!args.dry) {
+      unlinkSync(linkPath)
+      symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+    }
+    log(`  ~ ${name} 链接已更新到当前仓库`)
     continue
   }
   if (!args.dry) {
@@ -175,6 +189,9 @@ const block = [
   `    dataDir: ${yamlString(join(dataDir, '..', 'reading-inbox-data'))}`,
   `    journalDir: ${yamlString(dataDir)}`,
   `    python: ${yamlString(args.python)}`,
+  `    llm:`,
+  `      enabled: ${args.llm}`,
+  ...(args.provider ? [`      provider: ${yamlString(args.provider)}`, `      model: ${yamlString(args.model)}`] : []),
   `- id: journal-panel`,
   `  config:`,
   `    dataDir: ${yamlString(dataDir)}`,
